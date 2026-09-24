@@ -8,7 +8,9 @@ the union of every voice's event boundaries.
 from __future__ import annotations
 
 import re
+import sys
 from bisect import bisect_right
+from collections import deque
 from fractions import Fraction
 from math import gcd, lcm
 
@@ -533,4 +535,219 @@ def quantize_measure(
             for point, tick in zip(boundaries, ticks)
         ],
         "voices": quantized_voices,
+    }
+
+
+def find_sound_conflicts(
+    voice_a: dict, voice_b: dict
+) -> list[dict]:
+    """Find every positive-length overlap between two voices' sounds.
+
+    Each voice is {"name": str, "events": [built events]}; rest events
+    never take part. Two half-open event intervals [start, end) conflict
+    only when their intersection has strictly positive length, so events
+    that merely meet at a boundary (one end == the other start) do not
+    conflict. Returns conflict dicts ordered by (a position, b position):
+    ``{"a", "b", "overlap"}`` with the two built sound events.
+    """
+    sounds_a = [
+        event for event in voice_a["events"] if event["kind"] == KIND_SOUND
+    ]
+    sounds_b = [
+        event for event in voice_b["events"] if event["kind"] == KIND_SOUND
+    ]
+
+    conflicts: list[dict] = []
+    index_b = 0
+    for event_a in sounds_a:
+        # Skip B events that end at or before A starts (boundary contact
+        # included: end == start is not a positive overlap).
+        while index_b < len(sounds_b) and sounds_b[index_b]["end"] <= event_a["start"]:
+            index_b += 1
+        probe = index_b
+        while probe < len(sounds_b) and sounds_b[probe]["start"] < event_a["end"]:
+            event_b = sounds_b[probe]
+            overlap = min(event_a["end"], event_b["end"]) - max(
+                event_a["start"], event_b["start"]
+            )
+            if overlap > 0:
+                conflicts.append(
+                    {"a": event_a, "b": event_b, "overlap": overlap}
+                )
+            probe += 1
+    return conflicts
+
+
+class _FractionDinic:
+    """Max flow on capacities kept as exact Fractions.
+
+    Edges live in a flat table, added in forward/reverse pairs: the
+    reverse of edge i is edge i ^ 1. All arithmetic stays in Fraction,
+    so the resulting min-cut value is an exact rational.
+    """
+
+    def __init__(self, node_count: int) -> None:
+        self.node_count = node_count
+        self.adjacency: list[list[int]] = [[] for _ in range(node_count)]
+        self.edges: list[dict] = []
+
+    def add_edge(self, source: int, target: int, capacity: Fraction) -> None:
+        forward_index = len(self.edges)
+        self.edges.append({"to": target, "capacity": capacity})
+        self.edges.append({"to": source, "capacity": Fraction(0)})
+        self.adjacency[source].append(forward_index)
+        self.adjacency[target].append(forward_index ^ 1)
+
+    def max_flow(self, source: int, sink: int, limit: Fraction) -> Fraction:
+        flow = Fraction(0)
+        # The longest simple augmenting path has at most node_count edges;
+        # keep the DFS comfortably off the recursion limit.
+        previous_limit = sys.getrecursionlimit()
+        needed = self.node_count + 50
+        if needed > previous_limit:
+            sys.setrecursionlimit(needed * 2)
+        try:
+            while flow < limit:
+                levels = self._build_levels(source, sink)
+                if levels is None:
+                    break
+                next_edge = [0] * self.node_count
+
+                def augment(node: int, pushed: Fraction) -> Fraction:
+                    if node == sink:
+                        return pushed
+                    outgoing = self.adjacency[node]
+                    while next_edge[node] < len(outgoing):
+                        edge_index = outgoing[next_edge[node]]
+                        edge = self.edges[edge_index]
+                        if (
+                            edge["capacity"] > 0
+                            and levels[edge["to"]] == levels[node] + 1
+                        ):
+                            sent = augment(
+                                edge["to"], min(pushed, edge["capacity"])
+                            )
+                            if sent > 0:
+                                edge["capacity"] -= sent
+                                self.edges[edge_index ^ 1]["capacity"] += sent
+                                return sent
+                        next_edge[node] += 1
+                    return Fraction(0)
+
+                while flow < limit:
+                    sent = augment(source, limit - flow)
+                    if sent == 0:
+                        break
+                    flow += sent
+        finally:
+            if needed > previous_limit:
+                sys.setrecursionlimit(previous_limit)
+        return flow
+
+    def _build_levels(self, source: int, sink: int) -> list[int] | None:
+        levels = [-1] * self.node_count
+        levels[source] = 0
+        queue = deque([source])
+        while queue:
+            node = queue.popleft()
+            for edge_index in self.adjacency[node]:
+                edge = self.edges[edge_index]
+                if edge["capacity"] > 0 and levels[edge["to"]] < 0:
+                    levels[edge["to"]] = levels[node] + 1
+                    queue.append(edge["to"])
+        return levels if levels[sink] >= 0 else None
+
+    def reachable_from_source(self, source: int) -> set[int]:
+        """Nodes reachable from source via residual edges after max flow."""
+        seen = {source}
+        queue = deque([source])
+        while queue:
+            node = queue.popleft()
+            for edge_index in self.adjacency[node]:
+                edge = self.edges[edge_index]
+                if edge["capacity"] > 0 and edge["to"] not in seen:
+                    seen.add(edge["to"])
+                    queue.append(edge["to"])
+        return seen
+
+
+def avoidance_muting(voice_a: dict, voice_b: dict) -> dict:
+    """Pick whole sound events to mute so no sound/sound overlap remains.
+
+    The conflict graph is bipartite (one part per voice): a sound event
+    is a vertex weighted by its own positive duration, and every
+    positive-length overlap with an event of the other voice is an edge.
+    Muting an event removes every incident conflict; events may never be
+    split, so a feasible set of mutes is exactly a vertex cover. The
+    minimum-weight vertex cover (weights = original event durations) is
+    found exactly with a min-cut / max-flow reduction using Fraction
+    capacities:
+
+        source -> a-event, capacity duration
+        b-event -> sink, capacity duration
+        a-event -> b-event, capacity infinity for each conflict
+
+    Vertices on the source side of a minimum cut are the chosen cover;
+    total muted duration is the exact rational min-cut value. Rest
+    events and boundary-only contacts are excluded. Returns
+    ``{"conflicts": [...], "muted": [...], "total_muted": Fraction}``.
+    """
+    conflicts = find_sound_conflicts(voice_a, voice_b)
+
+    sounds_a = [
+        event for event in voice_a["events"] if event["kind"] == KIND_SOUND
+    ]
+    sounds_b = [
+        event for event in voice_b["events"] if event["kind"] == KIND_SOUND
+    ]
+    index_a = {event["id"]: position for position, event in enumerate(sounds_a)}
+    index_b = {event["id"]: position for position, event in enumerate(sounds_b)}
+
+    total_sound = sum(
+        (event["duration"] for event in sounds_a + sounds_b), Fraction(0)
+    )
+
+    source_node = 0
+    a_nodes_start = 1
+    b_nodes_start = a_nodes_start + len(sounds_a)
+    sink_node = b_nodes_start + len(sounds_b)
+    network = _FractionDinic(sink_node + 1)
+
+    for position, event in enumerate(sounds_a):
+        network.add_edge(
+            source_node, a_nodes_start + position, event["duration"]
+        )
+    for position, event in enumerate(sounds_b):
+        network.add_edge(
+            b_nodes_start + position, sink_node, event["duration"]
+        )
+    # Infinity strictly larger than every finite cut (the sum of all
+    # vertex weights) guarantees no conflict edge is ever cut.
+    infinite = total_sound + 1
+    for conflict in conflicts:
+        network.add_edge(
+            a_nodes_start + index_a[conflict["a"]["id"]],
+            b_nodes_start + index_b[conflict["b"]["id"]],
+            infinite,
+        )
+
+    network.max_flow(source_node, sink_node, limit=total_sound)
+    reachable = network.reachable_from_source(source_node)
+
+    # Min-cut cover: A vertices on the sink side, B vertices on the
+    # source side. Stored voice order fixes the output ordering.
+    muted: list[dict] = []
+    for position, event in enumerate(sounds_a):
+        if a_nodes_start + position not in reachable:
+            muted.append({"voice": voice_a["name"], "event": event})
+    for position, event in enumerate(sounds_b):
+        if b_nodes_start + position in reachable:
+            muted.append({"voice": voice_b["name"], "event": event})
+
+    return {
+        "conflicts": conflicts,
+        "muted": muted,
+        "total_muted": sum(
+            (entry["event"]["duration"] for entry in muted), Fraction(0)
+        ),
     }

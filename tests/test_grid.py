@@ -9,9 +9,11 @@ from app.grid import (
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
     align_loops,
+    avoidance_muting,
     build_voice_events,
     compute_grid,
     find_rhythm_match,
+    find_sound_conflicts,
     format_rational,
     parse_nonnegative_rational,
     parse_rational,
@@ -525,6 +527,189 @@ class QuantizeMeasureTest(unittest.TestCase):
                 ("v2e1", KIND_REST), ("v2e2", KIND_SOUND),
             ],
         )
+
+
+class FindSoundConflictsTest(unittest.TestCase):
+    def test_events_meeting_at_a_boundary_do_not_conflict(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        self.assertEqual(find_sound_conflicts(voices[0], voices[1]), [])
+        # The reverse ordering must agree.
+        self.assertEqual(find_sound_conflicts(voices[1], voices[0]), [])
+
+    def test_rest_events_never_conflict(self):
+        voices = make_voices(
+            [("a", [(KIND_REST, "1")]), ("b", [(KIND_SOUND, "1")])]
+        )
+        self.assertEqual(find_sound_conflicts(voices[0], voices[1]), [])
+
+    def test_positive_overlaps_are_reported_in_order(self):
+        # a: sound [0, 3/5]
+        # b: sound [0, 1/4], rest, sound [1/2, 3/4]
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "3/5"), (KIND_REST, "2/5")]),
+                ("b", [
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                ]),
+            ]
+        )
+        conflicts = find_sound_conflicts(voices[0], voices[1])
+        self.assertEqual(
+            [(c["a"]["id"], c["b"]["id"]) for c in conflicts],
+            [("v1e1", "v2e1"), ("v1e1", "v2e3")],
+        )
+        # min(3/5,1/4)-max(0,0) = 1/4 ; min(3/5,3/4)-max(0,1/2) = 1/10.
+        self.assertEqual(
+            [c["overlap"] for c in conflicts],
+            [Fraction(1, 4), Fraction(1, 10)],
+        )
+
+    def test_zero_length_intersection_inside_an_event_chain_is_skipped(self):
+        # b's first sound ends exactly at 1/3 where a's sound starts:
+        # boundary contact, while b's second sound genuinely overlaps.
+        voices = make_voices(
+            [
+                ("a", [(KIND_REST, "1/3"), (KIND_SOUND, "1/3"), (KIND_REST, "1/3")]),
+                ("b", [(KIND_SOUND, "1/3"), (KIND_SOUND, "2/3")]),
+            ]
+        )
+        conflicts = find_sound_conflicts(voices[0], voices[1])
+        self.assertEqual(
+            [(c["a"]["id"], c["b"]["id"], c["overlap"]) for c in conflicts],
+            [("v1e2", "v2e2", Fraction(1, 3))],
+        )
+
+
+class AvoidanceMutingTest(unittest.TestCase):
+    def test_no_conflict_mutes_nothing(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")]),
+                ("b", [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["muted"], [])
+        self.assertEqual(result["total_muted"], Fraction(0))
+
+    def test_single_conflict_mutes_the_shorter_event_whole(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+                ("b", [
+                    (KIND_REST, "1/12"), (KIND_SOUND, "1/12"),
+                    (KIND_REST, "5/6"),
+                ]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(result["conflicts"][0]["overlap"], Fraction(1, 12))
+        self.assertEqual(
+            [(m["event"]["id"], m["voice"]) for m in result["muted"]],
+            [("v2e2", "b")],
+        )
+        # The full original event duration is muted, not just the overlap.
+        self.assertEqual(result["total_muted"], Fraction(1, 12))
+
+    def test_shared_long_event_is_muted_once_beating_two_shorter_events(self):
+        # One A event (3/5) overlaps two B events (1/4 + 1/4): muting the
+        # A event costs 3/5, muting both B events costs 1/2.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "3/5"), (KIND_REST, "2/5")]),
+                ("b", [
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                ]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        self.assertEqual(
+            [(m["event"]["id"], m["voice"]) for m in result["muted"]],
+            [("v2e1", "b"), ("v2e3", "b")],
+        )
+        self.assertEqual(result["total_muted"], Fraction(1, 2))
+
+    def test_pairwise_greedy_is_strictly_worse_than_global_cover(self):
+        # Connected conflict path b1 - a1 - b2 - a2:
+        #   edges (a1,b1), (a1,b2), (a2,b2)
+        # weights: a1 = a2 = 1, b1 = 1/100, b2 = 101/100.
+        # An edge-by-edge greedy (cheapest endpoint of each conflict in
+        # order) mutes b1 (1/100), a1 (1 < 101/100), a2 (1 < 101/100):
+        # 201/100 total. The global minimum cover {b1, b2} costs 51/50.
+        #
+        # a1 sound [0,1]; rest 1/20; a2 sound [21/20,41/20]; rest 9/20
+        # b1 sound [0,1/100]; rest 49/100; b2 sound [1/2,151/100];
+        # rest 99/100  (both voices total 5/2)
+        voices = make_voices(
+            [
+                ("a", [
+                    (KIND_SOUND, "1"), (KIND_REST, "1/20"),
+                    (KIND_SOUND, "1"), (KIND_REST, "9/20"),
+                ]),
+                ("b", [
+                    (KIND_SOUND, "1/100"), (KIND_REST, "49/100"),
+                    (KIND_SOUND, "101/100"), (KIND_REST, "99/100"),
+                ]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        self.assertEqual(
+            [(c["a"]["id"], c["b"]["id"]) for c in result["conflicts"]],
+            [("v1e1", "v2e1"), ("v1e1", "v2e3"), ("v1e3", "v2e3")],
+        )
+        self.assertEqual(
+            [c["overlap"] for c in result["conflicts"]],
+            [Fraction(1, 100), Fraction(1, 2), Fraction(23, 50)],
+        )
+        self.assertEqual(result["total_muted"], Fraction(51, 50))
+        self.assertEqual(
+            [(m["event"]["id"], m["voice"]) for m in result["muted"]],
+            [("v2e1", "b"), ("v2e3", "b")],
+        )
+
+    def test_exact_fraction_weights_no_floating_point_error(self):
+        # Durations in thirds/sevenths would misbehave in float.
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "1/7"), (KIND_REST, "6/7")]),
+                ("b", [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        self.assertEqual(len(result["conflicts"]), 1)
+        self.assertEqual(result["conflicts"][0]["overlap"], Fraction(1, 7))
+        self.assertEqual(result["total_muted"], Fraction(1, 7))
+        muted_ids = {m["event"]["id"] for m in result["muted"]}
+        self.assertEqual(muted_ids, {"v1e1"})
+
+    def test_muted_set_is_a_cover_of_every_reported_conflict(self):
+        voices = make_voices(
+            [
+                ("a", [(KIND_SOUND, "3/5"), (KIND_REST, "2/5")]),
+                ("b", [
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                    (KIND_SOUND, "1/4"), (KIND_REST, "1/4"),
+                ]),
+            ]
+        )
+        result = avoidance_muting(voices[0], voices[1])
+        muted = {(m["voice"], m["event"]["id"]) for m in result["muted"]}
+        self.assertTrue(muted)
+        for conflict in result["conflicts"]:
+            covered = (
+                ("a", conflict["a"]["id"]) in muted
+                or ("b", conflict["b"]["id"]) in muted
+            )
+            self.assertTrue(covered)
 
 
 if __name__ == "__main__":
