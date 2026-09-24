@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
+from collections import deque
 from fractions import Fraction
 from math import gcd, lcm
 
@@ -533,4 +534,241 @@ def quantize_measure(
             for point, tick in zip(boundaries, ticks)
         ],
         "voices": quantized_voices,
+    }
+
+
+# --- Two-voice collision avoidance preview ---------------------------------
+
+
+class _FractionMaxFlow:
+    """Dinic max flow on a small graph with exact Fraction capacities.
+
+    Used to solve the bipartite minimum-weight vertex cover behind the
+    two-voice avoidance preview without leaving exact rational arithmetic.
+    """
+
+    def __init__(self, node_count: int) -> None:
+        self.graph: list[list[dict]] = [[] for _ in range(node_count)]
+
+    def add_edge(self, source: int, target: int, capacity: Fraction) -> None:
+        forward = {"to": target, "capacity": capacity, "rev": len(self.graph[target])}
+        backward = {"to": source, "capacity": Fraction(0), "rev": len(self.graph[source])}
+        self.graph[source].append(forward)
+        self.graph[target].append(backward)
+
+    def max_flow(self, source: int, sink: int, budget: Fraction) -> Fraction:
+        total = Fraction(0)
+        while budget > 0:
+            level = self._bfs_levels(source, sink)
+            if level is None:
+                break
+            next_edge = [0] * len(self.graph)
+            while budget > 0:
+                pushed = self._dfs(source, sink, budget, level, next_edge)
+                if pushed == 0:
+                    break
+                total += pushed
+                budget -= pushed
+        return total
+
+    def _bfs_levels(self, source: int, sink: int) -> list[int] | None:
+        level = [-1] * len(self.graph)
+        level[source] = 0
+        queue = deque([source])
+        while queue:
+            node = queue.popleft()
+            for edge in self.graph[node]:
+                if edge["capacity"] > 0 and level[edge["to"]] < 0:
+                    level[edge["to"]] = level[node] + 1
+                    queue.append(edge["to"])
+        return level if level[sink] >= 0 else None
+
+    def _dfs(
+        self,
+        node: int,
+        sink: int,
+        pushed: Fraction,
+        level: list[int],
+        next_edge: list[int],
+    ) -> Fraction:
+        if node == sink:
+            return pushed
+        edges = self.graph[node]
+        while next_edge[node] < len(edges):
+            edge = edges[next_edge[node]]
+            if edge["capacity"] > 0 and level[edge["to"]] == level[node] + 1:
+                flow = self._dfs(
+                    edge["to"],
+                    sink,
+                    min(pushed, edge["capacity"]),
+                    level,
+                    next_edge,
+                )
+                if flow > 0:
+                    edge["capacity"] -= flow
+                    self.graph[edge["to"]][edge["rev"]]["capacity"] += flow
+                    return flow
+            next_edge[node] += 1
+        return Fraction(0)
+
+    def reachable_from(self, source: int) -> set[int]:
+        """Nodes reachable from ``source`` over residual positive edges."""
+        seen = {source}
+        queue = deque([source])
+        while queue:
+            node = queue.popleft()
+            for edge in self.graph[node]:
+                if edge["capacity"] > 0 and edge["to"] not in seen:
+                    seen.add(edge["to"])
+                    queue.append(edge["to"])
+        return seen
+
+
+def _positive_overlap(left: dict, right: dict) -> Fraction | None:
+    """Length of the positive-length overlap of two half-open events.
+
+    Events span [start, end); returns None when they only touch at a
+    boundary or stay disjoint, so boundary adjacency never counts.
+    """
+    overlap = min(left["end"], right["end"]) - max(left["start"], right["start"])
+    return overlap if overlap > 0 else None
+
+
+def _sounding_conflicts(
+    events_a: list[dict], events_b: list[dict]
+) -> list[dict]:
+    """All positive-length overlaps between two voices' sound events.
+
+    Only ``kind == "sound"`` events take part (rests never conflict). A
+    two-pointer sweep over each voice's time-ordered, mutually disjoint
+    half-open intervals reports every crossing once, in (a position,
+    b position) order.
+    """
+    sounds_a = [event for event in events_a if event["kind"] == KIND_SOUND]
+    sounds_b = [event for event in events_b if event["kind"] == KIND_SOUND]
+
+    conflicts = []
+    index_b = 0
+    for event_a in sounds_a:
+        # Drop B events that end no later than this A event starts: half
+        # open, so equality is a boundary touch rather than an overlap.
+        while index_b < len(sounds_b) and sounds_b[index_b]["end"] <= event_a["start"]:
+            index_b += 1
+        scan = index_b
+        while scan < len(sounds_b) and sounds_b[scan]["start"] < event_a["end"]:
+            event_b = sounds_b[scan]
+            overlap = _positive_overlap(event_a, event_b)
+            if overlap is not None:
+                conflicts.append(
+                    {
+                        "a": event_a,
+                        "b": event_b,
+                        "overlap": overlap,
+                    }
+                )
+            scan += 1
+    return conflicts
+
+
+def avoid_two_voices(voice_a: dict, voice_b: dict) -> dict:
+    """Plan a minimum-total-duration set of events to mute.
+
+    The two voices' sounding events are treated as atomic: a conflict is
+    a strictly positive-length overlap of two half-open sound events
+    (rests do not participate; events merely meeting at a boundary do
+    not conflict), and resolving it means muting one of the two whole
+    events. Among every set of events covering all conflicts, the plan
+    minimizes the sum of the muted events' original durations.
+
+    This is a minimum-weight vertex cover of a bipartite graph (the two
+    voice sides, edges for conflicts, vertex weights = event durations),
+    solved exactly as a min cut with Fraction capacities: source -> A
+    events weighted by duration, A -> B conflict edges of infinite
+    capacity, B events -> sink weighted by duration. The cover is
+    recovered from the residual reachable set; it is the canonical
+    minimum cut (the source-reachable residual set is unique), which on
+    equal-weight alternatives mutes A-side events rather than B-side
+    ones.
+
+    ``voice_a`` / ``voice_b`` are {"name": str, "events": [built
+    events]}. Returns {"conflicts", "muted", "total_muted_duration"}:
+    conflicts and muted are ordered by (voice side, stored position);
+    every conflict carries the two original events and the exact overlap
+    length, every muted item carries its voice name and the original
+    event (id/kind/duration/start/end).
+    """
+    events_a = voice_a["events"]
+    events_b = voice_b["events"]
+    conflicts = _sounding_conflicts(events_a, events_b)
+
+    # Events that take part in at least one conflict; only they can be
+    # worth muting. Ordering follows each voice's stored event order, so
+    # the result never depends on dict insertion or floating timestamps.
+    order_a = {event["id"]: index for index, event in enumerate(events_a)}
+    order_b = {event["id"]: index for index, event in enumerate(events_b)}
+    conflict_a: dict[str, dict] = {}
+    conflict_b: dict[str, dict] = {}
+    for conflict in conflicts:
+        conflict_a[conflict["a"]["id"]] = conflict["a"]
+        conflict_b[conflict["b"]["id"]] = conflict["b"]
+    side_a = sorted(conflict_a.values(), key=lambda event: order_a[event["id"]])
+    side_b = sorted(conflict_b.values(), key=lambda event: order_b[event["id"]])
+
+    source = 0
+    sink = 1 + len(side_a) + len(side_b)
+    network = _FractionMaxFlow(sink + 1)
+    node_a = {event["id"]: 1 + index for index, event in enumerate(side_a)}
+    node_b = {
+        event["id"]: 1 + len(side_a) + index
+        for index, event in enumerate(side_b)
+    }
+
+    total_weight = sum(
+        (event["duration"] for event in side_a + side_b), Fraction(0)
+    )
+    infinite = total_weight + 1  # Strictly above every finite cut.
+
+    for event in side_a:
+        network.add_edge(source, node_a[event["id"]], event["duration"])
+    for event in side_b:
+        network.add_edge(node_b[event["id"]], sink, event["duration"])
+    for conflict in conflicts:
+        network.add_edge(
+            node_a[conflict["a"]["id"]],
+            node_b[conflict["b"]["id"]],
+            infinite,
+        )
+
+    network.max_flow(source, sink, budget=total_weight)
+    reachable = network.reachable_from(source)
+
+    # Cover of a canonical s-t min cut: A vertices on the sink side and
+    # B vertices on the source side must be taken; every infinite
+    # conflict edge is then covered (no reachable A -> unreachable B).
+    muted_a = [
+        event for event in side_a if node_a[event["id"]] not in reachable
+    ]
+    muted_b = [
+        event for event in side_b if node_b[event["id"]] in reachable
+    ]
+    muted = [
+        {"voice": voice_a["name"], "event": event} for event in muted_a
+    ] + [
+        {"voice": voice_b["name"], "event": event} for event in muted_b
+    ]
+
+    # Self-check: every reported conflict is covered exactly once or twice.
+    muted_ids = {(item["voice"], item["event"]["id"]) for item in muted}
+    for conflict in conflicts:
+        assert (
+            (voice_a["name"], conflict["a"]["id"]) in muted_ids
+            or (voice_b["name"], conflict["b"]["id"]) in muted_ids
+        )
+
+    return {
+        "conflicts": conflicts,
+        "muted": muted,
+        "total_muted_duration": sum(
+            (item["event"]["duration"] for item in muted), Fraction(0)
+        ),
     }

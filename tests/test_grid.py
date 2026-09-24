@@ -9,6 +9,7 @@ from app.grid import (
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
     align_loops,
+    avoid_two_voices,
     build_voice_events,
     compute_grid,
     find_rhythm_match,
@@ -524,6 +525,161 @@ class QuantizeMeasureTest(unittest.TestCase):
                 ("v1e1", KIND_SOUND), ("v1e2", KIND_REST), ("v1e3", KIND_SOUND),
                 ("v2e1", KIND_REST), ("v2e2", KIND_SOUND),
             ],
+        )
+
+
+class AvoidTwoVoicesTest(unittest.TestCase):
+    def plan(self, spec_a, spec_b):
+        voices = make_voices([("a", spec_a), ("b", spec_b)])
+        return avoid_two_voices(voices[0], voices[1])
+
+    def test_no_conflict_when_voices_only_meet_at_boundary(self):
+        # [0, 1/2) sound against [1/2, 1) sound: the touch at 1/2 is a
+        # zero-length intersection of the half-open intervals.
+        result = self.plan(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")],
+            [(KIND_REST, "1/2"), (KIND_SOUND, "1/2")],
+        )
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["muted"], [])
+        self.assertEqual(result["total_muted_duration"], Fraction(0))
+
+    def test_rests_never_participate(self):
+        # A rests for the whole measure while B sounds throughout.
+        result = self.plan(
+            [(KIND_REST, "1")],
+            [(KIND_SOUND, "1")],
+        )
+        self.assertEqual(result["conflicts"], [])
+        self.assertEqual(result["muted"], [])
+
+    def test_single_conflict_mutes_the_shorter_event(self):
+        # v1e1 [0, 1/2) overlaps v2e1 [0, 3/4) by 1/2; muting the shorter
+        # v1e1 costs 1/2 vs 3/4 for v2e1.
+        result = self.plan(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")],
+            [(KIND_SOUND, "3/4"), (KIND_REST, "1/4")],
+        )
+        self.assertEqual(len(result["conflicts"]), 1)
+        conflict = result["conflicts"][0]
+        self.assertEqual(
+            (conflict["a"]["id"], conflict["b"]["id"]), ("v1e1", "v2e1")
+        )
+        self.assertEqual(conflict["overlap"], Fraction(1, 2))
+        self.assertEqual(
+            [(item["voice"], item["event"]["id"]) for item in result["muted"]],
+            [("a", "v1e1")],
+        )
+        self.assertEqual(result["total_muted_duration"], Fraction(1, 2))
+
+    def test_muting_one_long_event_covers_several_conflicts(self):
+        # v1e1 spans [0, 1/2) and crosses two B sounds [0,1/4), [1/4,1/2):
+        # muting v1e1 once (1/2) is as cheap as both B events (1/2) and
+        # cheaper than any single B alone, which leaves one conflict.
+        result = self.plan(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")],
+            [(KIND_SOUND, "1/4"), (KIND_SOUND, "1/4"), (KIND_REST, "1/2")],
+        )
+        self.assertEqual(
+            [
+                (c["a"]["id"], c["b"]["id"]) for c in result["conflicts"]
+            ],
+            [("v1e1", "v2e1"), ("v1e1", "v2e2")],
+        )
+        self.assertEqual(result["total_muted_duration"], Fraction(1, 2))
+        self.assertEqual(
+            [(item["voice"], item["event"]["id"]) for item in result["muted"]],
+            [("a", "v1e1")],
+        )
+
+    def test_global_cover_picks_events_on_both_sides(self):
+        # A sounds [0,1/8), [1/8,1/4), [5/8,3/4) (each 1/8); B sounds
+        # [0,1/4) and [1/2,3/4) (each 1/4). Conflicts: a1-b1 (1/8),
+        # a2-b1 (1/8), a3-b2 (1/8). Covers: the three A events together
+        # cost 3/8, as does b1 + a3 (1/4 + 1/8); a1+a2+b2 costs 1/2.
+        # The minimum 3/8 must be found globally, not per-edge choices.
+        result = self.plan(
+            [
+                (KIND_SOUND, "1/8"),
+                (KIND_SOUND, "1/8"),
+                (KIND_REST, "3/8"),
+                (KIND_SOUND, "1/8"),
+                (KIND_REST, "1/4"),
+            ],
+            [
+                (KIND_SOUND, "1/4"),
+                (KIND_REST, "1/4"),
+                (KIND_SOUND, "1/4"),
+                (KIND_REST, "1/4"),
+            ],
+        )
+        self.assertEqual(len(result["conflicts"]), 3)
+        self.assertEqual(result["total_muted_duration"], Fraction(3, 8))
+        muted_ids = {
+            (item["voice"], item["event"]["id"]) for item in result["muted"]
+        }
+        for conflict in result["conflicts"]:
+            self.assertTrue(
+                ("a", conflict["a"]["id"]) in muted_ids
+                or ("b", conflict["b"]["id"]) in muted_ids
+            )
+
+    def test_equal_weight_tie_is_resolved_toward_the_a_side(self):
+        # One A sound of 1/4 against a B sound of 1/4 at the same time:
+        # muting either side costs 1/4. The canonical min cut takes A.
+        result = self.plan(
+            [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")],
+            [(KIND_SOUND, "1/4"), (KIND_REST, "3/4")],
+        )
+        self.assertEqual(
+            [(item["voice"], item["event"]["id"]) for item in result["muted"]],
+            [("a", "v1e1")],
+        )
+
+    def test_non_unit_fraction_weights_are_exact(self):
+        # A sound [0, 1/3) vs B sound [0, 1/2): overlap 1/3; muting A
+        # costs 1/3 vs B's 1/2. Floats would muddle this comparison.
+        result = self.plan(
+            [(KIND_SOUND, "1/3"), (KIND_REST, "2/3")],
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")],
+        )
+        self.assertEqual(result["conflicts"][0]["overlap"], Fraction(1, 3))
+        self.assertEqual(result["total_muted_duration"], Fraction(1, 3))
+        self.assertEqual(result["muted"][0]["event"]["id"], "v1e1")
+
+    def test_muted_items_keep_original_event_duration_and_voice(self):
+        result = self.plan(
+            [(KIND_SOUND, "1/2"), (KIND_REST, "1/2")],
+            [(KIND_SOUND, "3/4"), (KIND_REST, "1/4")],
+        )
+        (item,) = result["muted"]
+        self.assertEqual(item["voice"], "a")
+        self.assertEqual(
+            (
+                item["event"]["id"],
+                item["event"]["start"],
+                item["event"]["end"],
+                item["event"]["duration"],
+            ),
+            ("v1e1", Fraction(0), Fraction(1, 2), Fraction(1, 2)),
+        )
+
+    def test_conflicts_are_ordered_by_a_then_b_position(self):
+        # A long sound crosses three B sounds; pairs come out in order.
+        result = self.plan(
+            [(KIND_SOUND, "3/4"), (KIND_REST, "1/4")],
+            [
+                (KIND_SOUND, "1/4"),
+                (KIND_SOUND, "1/4"),
+                (KIND_SOUND, "1/4"),
+                (KIND_REST, "1/4"),
+            ],
+        )
+        self.assertEqual(
+            [
+                (c["a"]["id"], c["b"]["id"]) for c in result["conflicts"]
+            ],
+            [("v1e1", "v2e1"), ("v1e1", "v2e2"), ("v1e1", "v2e3")],
         )
 
 

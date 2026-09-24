@@ -205,3 +205,48 @@ class QuantizationPreviewOut(BaseModel):
     total_abs_shift: str
     boundaries: list[BoundaryMappingOut]
     voices: list[QuantizedVoiceOut]
+
+
+class VoiceAvoidanceIn(BaseModel):
+    """Two distinct voice names of the same saved measure to preview."""
+
+    voice_a: str = Field(min_length=1, max_length=100, examples=["melody"])
+    voice_b: str = Field(min_length=1, max_length=100, examples=["bass"])
+
+
+class ConflictEventOut(BaseModel):
+    """One endpoint of a conflict: its voice, event id and time span."""
+
+    voice: str
+    event_id: str
+    start: str
+    end: str
+    duration: str
+
+
+class ConflictPairOut(BaseModel):
+    """A positive-length overlap of one sound event from each voice."""
+
+    a: ConflictEventOut
+    b: ConflictEventOut
+    overlap: str
+
+
+class MutedEventOut(BaseModel):
+    """One whole sound event chosen to be muted, with its original duration."""
+
+    voice: str
+    event_id: str
+    start: str
+    end: str
+    duration: str
+
+
+class VoiceAvoidanceOut(BaseModel):
+    measure_id: int
+    target_duration: str
+    voice_a: str
+    voice_b: str
+    conflicts: list[ConflictPairOut]
+    muted: list[MutedEventOut]
+    total_muted_duration: str

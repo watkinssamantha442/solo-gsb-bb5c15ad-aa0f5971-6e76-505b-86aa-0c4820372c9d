@@ -171,6 +171,83 @@ curl -s -X POST http://localhost:8000/measures/1/quantization-preview \
 }
 ```
 
+### `POST /measures/{id}/voice-avoidance-preview` — 双声部避让静音预览（不写库）
+
+传入已保存小节中的**两个不同声部名**，预演两者同时发声时的避让方案：
+
+- 只有 `kind = "sound"` 的**发声事件**参与；**休止事件永远不冲突**。
+- 每个事件是**不可拆分的整体**：两个事件的半开区间 `[start, end)` 存在**正长度交集**
+  （即 `min(end) > max(start)`）时构成一对冲突；仅在边界点相接
+  （`end == start`，交集长度为 0）**不算冲突**。
+- 消解每对冲突的办法是把其中**任一事件整体静音**。服务用**精确有理数**求一组静音事件，
+  使被静音事件的**原时长之和最小**（不是重叠时长之和：静音一个事件损失的是它的完整
+  原时长）。返回每个静音事件的 ID、各自原时长、总静音时长，以及全部原始冲突事件对。
+- 该接口为**只读预览**：只从 SQLite 读取数据，**绝不改写存储**。
+
+数学上这是一个二分图的**最小权点覆盖**问题：两侧顶点分别是两个声部参与冲突的发声
+事件，边表示正长度重叠，顶点权 = 事件原时长；将其精确归约为最小割（源点→A 侧事件
+容量为时长、冲突边容量为无穷大、B 侧事件→汇点容量为时长）后，用容量全部为
+`fractions.Fraction` 的 Dinic 最大流求解，无浮点误差。割由最大流后源点残量可达集
+唯一恢复（规范最小割）；当存在多组总时长相同的最优方案时，结果确定且优先静音
+**A 侧（`voice_a`）**事件。
+
+- 请求体：`voice_a` / `voice_b` 均为 **1～100 字符**的非空声部名。
+- 小节 ID 不存在返回 **404**。
+- 两声部名相同、或任一声部名不在该小节中返回 **422**（相同优先判定；不存在时
+  detail 的 `missing_voices` 按 `voice_a`、`voice_b` 顺序列出找不到的名字）；
+  缺少字段或空名也返回 **422**（请求校验错误）。
+
+```bash
+curl -s -X POST http://localhost:8000/measures/1/voice-avoidance-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"voice_a": "melody", "voice_b": "bass"}'
+```
+
+例：小节时长 `1`，`melody` 为「声 1/3、休 1/6、声 1/3、休 1/6」，`bass` 为
+「声 5/12、休 1/12、声 1/2」。冲突有两对：`v1e1` 与 `v2e1` 在 `[0, 1/3)` 重叠
+`1/3`，`v1e3` 与 `v2e3` 在 `[2/3, 5/6)` 重叠 `1/3`。同时静音两个 melody 事件花费
+`1/3 + 1/3 = 2/3`，低于任何涉及 bass 事件的组合（如 `v2e1 + v1e3 = 3/4`），故最优
+方案静音 `v1e1`、`v1e3`：
+
+```json
+{
+  "measure_id": 1,
+  "target_duration": "1",
+  "voice_a": "melody",
+  "voice_b": "bass",
+  "conflicts": [
+    {
+      "a":  {"voice": "melody", "event_id": "v1e1", "start": "0",   "end": "1/3", "duration": "1/3"},
+      "b":  {"voice": "bass",   "event_id": "v2e1", "start": "0",   "end": "5/12", "duration": "5/12"},
+      "overlap": "1/3"
+    },
+    {
+      "a":  {"voice": "melody", "event_id": "v1e3", "start": "1/2", "end": "5/6", "duration": "1/3"},
+      "b":  {"voice": "bass",   "event_id": "v2e3", "start": "1/2", "end": "1",   "duration": "1/2"},
+      "overlap": "1/3"
+    }
+  ],
+  "muted": [
+    {"voice": "melody", "event_id": "v1e1", "start": "0",   "end": "1/3", "duration": "1/3"},
+    {"voice": "melody", "event_id": "v1e3", "start": "1/2", "end": "5/6", "duration": "1/3"}
+  ],
+  "total_muted_duration": "2/3"
+}
+```
+
+各字段含义：
+
+| 字段                    | 说明                                                                 |
+| ----------------------- | -------------------------------------------------------------------- |
+| `conflicts[].a` / `.b`  | 冲突双方的声部名、**原事件 ID** 及原 `start` / `end` / `duration`（`a` 属于 `voice_a`，`b` 属于 `voice_b`） |
+| `conflicts[].overlap`   | 两事件的正长度交集时长（精确分数，恒 > 0）                            |
+| `muted[]`               | 建议整体静音的事件：声部名、**原事件 ID**、原起止与**原时长**（静音损失按完整原时长计，非重叠部分） |
+| `total_muted_duration`  | 静音事件原时长之和（最小化目标，精确分数）；无冲突时为 `"0"`，`muted` 为空数组 |
+
+冲突对按 A 侧事件保存顺序、再按 B 侧事件保存顺序排列；`muted` 先列 A 侧再列 B 侧。
+两声部完全不冲突（例如发声区间只在边界相接、或一方始终休止）时，`conflicts` 与
+`muted` 均为空数组、`total_muted_duration` 为 `"0"`。
+
 ### `GET /measures/{id}/rhythm-matches?voice={声部名}` — 检索节奏等价声部
 
 以指定小节中的一个声部为**源声部**，在全部已保存小节中检索与它**节奏等价**的其他声部
@@ -285,7 +362,7 @@ python3 -m unittest discover -s tests -p 'test_grid.py'   # 仅核心逻辑（�
 
 ```
 app/
-  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化（纯标准库）
+  grid.py      # 核心逻辑：有理数解析、精确累加、边界并集切分网格、节奏等价匹配、循环对齐、等分刻度量化、双声部避让（二分图最小权点覆盖/精确分数最小割）（纯标准库）
   db.py        # SQLite 连接、建表、读写（纯标准库）
   schemas.py   # Pydantic 请求/响应模型与校验
   main.py      # FastAPI 应用与路由（启动时初始化数据库）

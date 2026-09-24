@@ -24,6 +24,14 @@ A saved voice can also be used as a rhythm query
 sound/rest pattern is the same sequence up to a cyclic shift and a
 single uniform tempo ratio are returned with that ratio and the
 smallest matching shift, all compared in exact fractions.
+
+Two voices of a saved measure can finally be previewed against each
+other (POST /measures/{id}/voice-avoidance-preview): positive-length
+overlaps of their sounding events are conflicts, and an exact-fraction
+minimum-weight vertex cover picks a minimum total-duration set of whole
+events to mute. Rest events never participate and boundary touches do
+not conflict. Like the quantization preview this is read-only; nothing
+is written back to SQLite.
 """
 
 from __future__ import annotations
@@ -39,6 +47,7 @@ from .grid import (
     LoopAlignmentTooLarge,
     QuantizationInfeasible,
     align_loops,
+    avoid_two_voices,
     build_voice_events,
     compute_grid,
     find_rhythm_match,
@@ -58,6 +67,8 @@ from .schemas import (
     QuantizationPreviewIn,
     QuantizationPreviewOut,
     RhythmMatchesOut,
+    VoiceAvoidanceIn,
+    VoiceAvoidanceOut,
 )
 
 
@@ -86,6 +97,7 @@ def root() -> dict:
             "get_measure": "GET /measures/{id}",
             "get_grid": "GET /measures/{id}/grid",
             "quantization_preview": "POST /measures/{id}/quantization-preview",
+            "voice_avoidance_preview": "POST /measures/{id}/voice-avoidance-preview",
             "rhythm_matches": "GET /measures/{id}/rhythm-matches?voice={name}",
             "loop_alignments": "POST /loop-alignments",
         },
@@ -245,6 +257,93 @@ def quantization_preview(measure_id: int, payload: QuantizationPreviewIn) -> dic
             }
             for voice in result["voices"]
         ],
+    }
+
+
+@app.post(
+    "/measures/{measure_id}/voice-avoidance-preview",
+    response_model=VoiceAvoidanceOut,
+)
+def voice_avoidance_preview(
+    measure_id: int, payload: VoiceAvoidanceIn
+) -> dict:
+    # Read-only: conflicts and the minimum-total-duration mute set are
+    # computed in exact fractions from the stored measure, but never
+    # written back.
+    measure = db.load_measure(measure_id)
+    if measure is None:
+        raise HTTPException(status_code=404, detail="measure not found")
+
+    if payload.voice_a == payload.voice_b:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice_a and voice_b must be two different voices",
+                "voice_a": payload.voice_a,
+                "voice_b": payload.voice_b,
+            },
+        )
+
+    stored_names = {voice["name"] for voice in measure["voices"]}
+    missing = [
+        name
+        for name in (payload.voice_a, payload.voice_b)
+        if name not in stored_names
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "voice not found in measure",
+                "missing_voices": missing,
+            },
+        )
+
+    _, fraction_voices = _fraction_voices(measure)
+    voice_a = next(
+        voice for voice in fraction_voices if voice["name"] == payload.voice_a
+    )
+    voice_b = next(
+        voice for voice in fraction_voices if voice["name"] == payload.voice_b
+    )
+
+    result = avoid_two_voices(voice_a, voice_b)
+
+    def conflict_event(voice_name: str, event: dict) -> dict:
+        return {
+            "voice": voice_name,
+            "event_id": event["id"],
+            "start": format_rational(event["start"]),
+            "end": format_rational(event["end"]),
+            "duration": format_rational(event["duration"]),
+        }
+
+    return {
+        "measure_id": measure["id"],
+        "target_duration": measure["target_duration"],
+        "voice_a": voice_a["name"],
+        "voice_b": voice_b["name"],
+        "conflicts": [
+            {
+                "a": conflict_event(voice_a["name"], conflict["a"]),
+                "b": conflict_event(voice_b["name"], conflict["b"]),
+                "overlap": format_rational(conflict["overlap"]),
+            }
+            for conflict in result["conflicts"]
+        ],
+        "muted": [
+            {
+                "voice": item["voice"],
+                "event_id": item["event"]["id"],
+                "start": format_rational(item["event"]["start"]),
+                "end": format_rational(item["event"]["end"]),
+                "duration": format_rational(item["event"]["duration"]),
+            }
+            for item in result["muted"]
+        ],
+        "total_muted_duration": format_rational(
+            result["total_muted_duration"]
+        ),
     }
 
 

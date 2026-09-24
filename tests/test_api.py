@@ -581,3 +581,201 @@ def test_rhythm_matches_404_for_missing_measure_or_voice():
 def test_rhythm_matches_requires_voice_query_parameter():
     source_id = client.post("/measures", json=RHYTHM_SOURCE_PAYLOAD).json()["id"]
     assert client.get(f"/measures/{source_id}/rhythm-matches").status_code == 422
+
+
+# --- POST /measures/{id}/voice-avoidance-preview ---------------------------
+
+# melody sounds [0,1/2) and [3/4,1); bass rests [0,1/4), sounds [1/4,1).
+# Conflicts: v1e1 vs v2e2 overlap [1/4,1/2) = 1/4;
+#            v1e3 vs v2e2 overlap [3/4,1) = 1/4.
+# Covering with the single bass event v2e2 costs its full 3/4; covering
+# with the two short melody events costs 1/2 + 1/4 = 3/4 as well. The
+# total is tied, so the canonical minimum cut prefers muting A-side
+# (melody) events: v1e1 and v1e3 for a total of 3/4.
+def test_voice_avoidance_preview_finds_conflicts_and_minimum_mute_set():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "melody", "voice_b": "bass"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["measure_id"] == measure_id
+    assert body["target_duration"] == "1"
+    assert body["voice_a"] == "melody"
+    assert body["voice_b"] == "bass"
+
+    assert body["conflicts"] == [
+        {
+            "a": {
+                "voice": "melody", "event_id": "v1e1",
+                "start": "0", "end": "1/2", "duration": "1/2",
+            },
+            "b": {
+                "voice": "bass", "event_id": "v2e2",
+                "start": "1/4", "end": "1", "duration": "3/4",
+            },
+            "overlap": "1/4",
+        },
+        {
+            "a": {
+                "voice": "melody", "event_id": "v1e3",
+                "start": "3/4", "end": "1", "duration": "1/4",
+            },
+            "b": {
+                "voice": "bass", "event_id": "v2e2",
+                "start": "1/4", "end": "1", "duration": "3/4",
+            },
+            "overlap": "1/4",
+        },
+    ]
+    assert body["muted"] == [
+        {
+            "voice": "melody", "event_id": "v1e1",
+            "start": "0", "end": "1/2", "duration": "1/2",
+        },
+        {
+            "voice": "melody", "event_id": "v1e3",
+            "start": "3/4", "end": "1", "duration": "1/4",
+        },
+    ]
+    assert body["total_muted_duration"] == "3/4"
+
+    # Swapping the two voices keeps the same minimum cost but, by the
+    # canonical A-side preference, mutes the single long bass event.
+    swapped = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "bass", "voice_b": "melody"},
+    )
+    assert swapped.status_code == 200, response.text
+    swapped_body = swapped.json()
+    assert [
+        (m["voice"], m["event_id"]) for m in swapped_body["muted"]
+    ] == [("bass", "v2e2")]
+    assert swapped_body["total_muted_duration"] == "3/4"
+
+    # The preview is read-only: the stored measure is unchanged.
+    stored = client.get(f"/measures/{measure_id}").json()
+    assert stored["voices"][0]["events"][0]["kind"] == "sound"
+
+
+def test_voice_avoidance_preview_muting_one_side_can_be_cheaper():
+    # One short melody sound crossed by two bass sounds: muting the
+    # melody once costs 1/2, the same as both bass events; the canonical
+    # minimum cut takes the A side, so the single melody event is muted.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "melody", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "bass", "events": [
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "sound", "duration": "1/4"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+        ],
+    }
+    measure_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "melody", "voice_b": "bass"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [
+        (c["a"]["event_id"], c["b"]["event_id"], c["overlap"])
+        for c in body["conflicts"]
+    ] == [("v1e1", "v2e1", "1/4"), ("v1e1", "v2e2", "1/4")]
+    assert [
+        (m["voice"], m["event_id"], m["duration"]) for m in body["muted"]
+    ] == [("melody", "v1e1", "1/2")]
+    assert body["total_muted_duration"] == "1/2"
+
+
+def test_voice_avoidance_preview_boundary_touch_and_rests_give_no_conflict():
+    # left sounds [0,1/2) then rests; right rests [0,1/2), then sounds
+    # [1/2,1): the two sound events only meet at t = 1/2, a zero-length
+    # intersection of the half-open intervals, so nothing is muted.
+    payload = {
+        "target_duration": "1",
+        "voices": [
+            {"name": "left", "events": [
+                {"kind": "sound", "duration": "1/2"},
+                {"kind": "rest", "duration": "1/2"},
+            ]},
+            {"name": "right", "events": [
+                {"kind": "rest", "duration": "1/2"},
+                {"kind": "sound", "duration": "1/2"},
+            ]},
+        ],
+    }
+    touch_id = client.post("/measures", json=payload).json()["id"]
+    response = client.post(
+        f"/measures/{touch_id}/voice-avoidance-preview",
+        json={"voice_a": "left", "voice_b": "right"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["conflicts"] == []
+    assert body["muted"] == []
+    assert body["total_muted_duration"] == "0"
+
+
+def test_voice_avoidance_preview_404_for_missing_measure():
+    response = client.post(
+        "/measures/999999/voice-avoidance-preview",
+        json={"voice_a": "melody", "voice_b": "bass"},
+    )
+    assert response.status_code == 404
+
+
+def test_voice_avoidance_preview_rejects_unknown_and_equal_voices():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+
+    # Same voice on both sides: 422 even though the name exists.
+    response = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "melody", "voice_b": "melody"},
+    )
+    assert response.status_code == 422, response.text
+    assert "different" in response.json()["detail"]["message"]
+
+    # One unknown voice: 422.
+    response = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "melody", "voice_b": "drums"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["missing_voices"] == ["drums"]
+
+    # Both unknown: both names are reported.
+    response = client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "drums", "voice_b": "choir"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["missing_voices"] == ["drums", "choir"]
+
+    # Missing body fields / empty names: 422.
+    assert client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/measures/{measure_id}/voice-avoidance-preview",
+        json={"voice_a": "", "voice_b": "bass"},
+    ).status_code == 422
+
+
+def test_voice_avoidance_preview_does_not_modify_storage():
+    measure_id = client.post("/measures", json=VALID_PAYLOAD).json()["id"]
+    before = client.get(f"/measures/{measure_id}").json()
+    for _ in range(2):
+        response = client.post(
+            f"/measures/{measure_id}/voice-avoidance-preview",
+            json={"voice_a": "melody", "voice_b": "bass"},
+        )
+        assert response.status_code == 200
+    after = client.get(f"/measures/{measure_id}").json()
+    assert before == after
